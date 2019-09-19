@@ -22,134 +22,148 @@ from __future__ import print_function
 from tensor2tensor.trax import layers as tl
 
 
-def ConvBlock(kernel_size, filters, strides):
+def ConvBlock(kernel_size, filters, strides, mode='train'):
   """ResNet convolutional striding block."""
+  # TODO(jonni): Use good defaults so Resnet50 code is cleaner / less redundant.
   ks = kernel_size
   filters1, filters2, filters3 = filters
-  main = tl.Serial(
+  main = [
       tl.Conv(filters1, (1, 1), strides),
-      tl.BatchNorm(),
+      tl.BatchNorm(mode=mode),
       tl.Relu(),
       tl.Conv(filters2, (ks, ks), padding='SAME'),
-      tl.BatchNorm(),
+      tl.BatchNorm(mode=mode),
       tl.Relu(),
       tl.Conv(filters3, (1, 1)),
-      tl.BatchNorm()
-  )
-  shortcut = tl.Serial(
+      tl.BatchNorm(mode=mode),
+  ]
+  shortcut = [
       tl.Conv(filters3, (1, 1), strides),
-      tl.BatchNorm()
-  )
-  return tl.Serial(
+      tl.BatchNorm(mode=mode),
+  ]
+  return [
       tl.Residual(main, shortcut=shortcut),
-      tl.Relu()
-  )
+      tl.Relu(),
+  ]
 
 
-def IdentityBlock(kernel_size, filters):
+def IdentityBlock(kernel_size, filters, mode='train'):
   """ResNet identical size block."""
+  # TODO(jonni): Use good defaults so Resnet50 code is cleaner / less redundant.
   ks = kernel_size
   filters1, filters2, filters3 = filters
-  main = tl.Serial(
+  main = [
       tl.Conv(filters1, (1, 1)),
-      tl.BatchNorm(),
+      tl.BatchNorm(mode=mode),
       tl.Relu(),
       tl.Conv(filters2, (ks, ks), padding='SAME'),
-      tl.BatchNorm(),
+      tl.BatchNorm(mode=mode),
       tl.Relu(),
       tl.Conv(filters3, (1, 1)),
-      tl.BatchNorm()
-  )
-  return tl.Serial(
+      tl.BatchNorm(mode=mode),
+  ]
+  return [
       tl.Residual(main),
-      tl.Relu()
-  )
+      tl.Relu(),
+  ]
 
 
-def Resnet50(hidden_size=64, num_output_classes=1001, mode='train'):
+def Resnet50(d_hidden=64, n_output_classes=1001, mode='train'):
   """ResNet.
 
   Args:
-    hidden_size: the size of the first hidden layer (multiplied later).
-    num_output_classes: how many classes to distinguish.
-    mode: whether we are training or evaluating or doing inference.
+    d_hidden: Dimensionality of the first hidden layer (multiplied later).
+    n_output_classes: Number of distinct output classes.
+    mode: Whether we are training or evaluating or doing inference.
 
   Returns:
-    The ResNet model with the given layer and output sizes.
+    The list of layers comprising a ResNet model with the given parameters.
   """
-  del mode
-  return tl.Serial(
-      tl.Conv(hidden_size, (7, 7), (2, 2), 'SAME'),
-      tl.BatchNorm(), tl.Relu(),
+  return tl.Model(
+      tl.ToFloat(),
+      tl.Conv(d_hidden, (7, 7), (2, 2), 'SAME'),
+      tl.BatchNorm(mode=mode),
+      tl.Relu(),
       tl.MaxPool(pool_size=(3, 3), strides=(2, 2)),
-      ConvBlock(3, [hidden_size, hidden_size, 4 * hidden_size], (1, 1)),
-      IdentityBlock(3, [hidden_size, hidden_size, 4 * hidden_size]),
-      IdentityBlock(3, [hidden_size, hidden_size, 4 * hidden_size]),
-      ConvBlock(3, [2 * hidden_size, 2 * hidden_size, 8 * hidden_size], (2, 2)),
-      IdentityBlock(3, [2 * hidden_size, 2 * hidden_size, 8 * hidden_size]),
-      IdentityBlock(3, [2 * hidden_size, 2 * hidden_size, 8 * hidden_size]),
-      IdentityBlock(3, [2 * hidden_size, 2 * hidden_size, 8 * hidden_size]),
-      ConvBlock(3, [4 * hidden_size, 4 * hidden_size, 16*hidden_size], (2, 2)),
-      IdentityBlock(3, [4 * hidden_size, 4 * hidden_size, 16 * hidden_size]),
-      IdentityBlock(3, [4 * hidden_size, 4 * hidden_size, 16 * hidden_size]),
-      IdentityBlock(3, [4 * hidden_size, 4 * hidden_size, 16 * hidden_size]),
-      IdentityBlock(3, [4 * hidden_size, 4 * hidden_size, 16 * hidden_size]),
-      IdentityBlock(3, [4 * hidden_size, 4 * hidden_size, 16 * hidden_size]),
-      ConvBlock(3, [8 * hidden_size, 8 * hidden_size, 32*hidden_size], (2, 2)),
-      IdentityBlock(3, [8 * hidden_size, 8 * hidden_size, 32 * hidden_size]),
-      IdentityBlock(3, [8 * hidden_size, 8 * hidden_size, 32 * hidden_size]),
+      ConvBlock(3, [d_hidden, d_hidden, 4 * d_hidden], (1, 1), mode=mode),
+      IdentityBlock(3, [d_hidden, d_hidden, 4 * d_hidden], mode=mode),
+      IdentityBlock(3, [d_hidden, d_hidden, 4 * d_hidden], mode=mode),
+      ConvBlock(3, [2 * d_hidden, 2 * d_hidden, 8 * d_hidden], (2, 2),
+                mode=mode),
+      IdentityBlock(3, [2 * d_hidden, 2 * d_hidden, 8 * d_hidden], mode=mode),
+      IdentityBlock(3, [2 * d_hidden, 2 * d_hidden, 8 * d_hidden], mode=mode),
+      IdentityBlock(3, [2 * d_hidden, 2 * d_hidden, 8 * d_hidden], mode=mode),
+      ConvBlock(3, [4 * d_hidden, 4 * d_hidden, 16 * d_hidden], (2, 2),
+                mode=mode),
+      IdentityBlock(3, [4 * d_hidden, 4 * d_hidden, 16 * d_hidden], mode=mode),
+      IdentityBlock(3, [4 * d_hidden, 4 * d_hidden, 16 * d_hidden], mode=mode),
+      IdentityBlock(3, [4 * d_hidden, 4 * d_hidden, 16 * d_hidden], mode=mode),
+      IdentityBlock(3, [4 * d_hidden, 4 * d_hidden, 16 * d_hidden], mode=mode),
+      IdentityBlock(3, [4 * d_hidden, 4 * d_hidden, 16 * d_hidden], mode=mode),
+      ConvBlock(3, [8 * d_hidden, 8 * d_hidden, 32 * d_hidden], (2, 2),
+                mode=mode),
+      IdentityBlock(3, [8 * d_hidden, 8 * d_hidden, 32 * d_hidden], mode=mode),
+      IdentityBlock(3, [8 * d_hidden, 8 * d_hidden, 32 * d_hidden], mode=mode),
       tl.AvgPool(pool_size=(7, 7)),
       tl.Flatten(),
-      tl.Dense(num_output_classes),
-      tl.LogSoftmax()
+      tl.Dense(n_output_classes),
+      tl.LogSoftmax(),
   )
 
 
-def WideResnetBlock(channels, strides=(1, 1), channel_mismatch=False):
-  """WideResnet convolutational block."""
-  main = tl.Serial(
-      tl.BatchNorm(),
+def WideResnetBlock(channels, strides=(1, 1), bn_momentum=0.9, mode='train'):
+  """WideResnet convolutional block."""
+  return [
+      tl.BatchNorm(momentum=bn_momentum, mode=mode),
       tl.Relu(),
       tl.Conv(channels, (3, 3), strides, padding='SAME'),
-      tl.BatchNorm(),
+      tl.BatchNorm(momentum=bn_momentum, mode=mode),
       tl.Relu(),
-      tl.Conv(channels, (3, 3), padding='SAME'))
-  shortcut = tl.Copy() if not channel_mismatch else tl.Conv(
-      channels, (3, 3), strides, padding='SAME')
-  return tl.Residual(main, shortcut=shortcut)
+      tl.Conv(channels, (3, 3), padding='SAME'),
+  ]
 
 
-def WideResnetGroup(n, channels, strides=(1, 1)):
-  blocks = []
-  blocks += [WideResnetBlock(channels, strides, channel_mismatch=True)]
-  for _ in range(n - 1):
-    blocks += [WideResnetBlock(channels, (1, 1))]
-  return tl.Serial(*blocks)
+def WideResnetGroup(n, channels, strides=(1, 1), bn_momentum=0.9, mode='train'):
+  shortcut = [
+      tl.Conv(channels, (3, 3), strides, padding='SAME'),
+  ]
+  return [
+      tl.Residual(WideResnetBlock(channels, strides, bn_momentum=bn_momentum,
+                                  mode=mode),
+                  shortcut=shortcut),
+      tl.Residual([WideResnetBlock(channels, (1, 1), bn_momentum=bn_momentum,
+                                   mode=mode)
+                   for _ in range(n - 1)]),
+  ]
 
 
-def WideResnet(num_blocks=3, hidden_size=64, num_output_classes=10,
+def WideResnet(n_blocks=3, widen_factor=1, n_output_classes=10, bn_momentum=0.9,
                mode='train'):
   """WideResnet from https://arxiv.org/pdf/1605.07146.pdf.
 
   Args:
-    num_blocks: int, number of blocks in a group.
-    hidden_size: the size of the first hidden layer (multiplied later).
-    num_output_classes: int, number of classes to distinguish.
-    mode: is it training or eval.
+    n_blocks: int, number of blocks in a group. total layers = 6n + 4.
+    widen_factor: int, widening factor of each group. k=1 is vanilla resnet.
+    n_output_classes: int, number of distinct output classes.
+    bn_momentum: float, momentum in BatchNorm.
+    mode: Whether we are training or evaluating or doing inference.
 
   Returns:
-    The WideResnet model with given layer and output sizes.
+    The list of layers comprising a WideResnet model with the given parameters.
   """
-  del mode
-  return tl.Serial(
-      tl.Conv(hidden_size, (3, 3), padding='SAME'),
-      WideResnetGroup(num_blocks, hidden_size),
-      WideResnetGroup(num_blocks, hidden_size * 2, (2, 2)),
-      WideResnetGroup(num_blocks, hidden_size * 4, (2, 2)),
-      tl.BatchNorm(),
+  return tl.Model(
+      tl.ToFloat(),
+      tl.Conv(16, (3, 3), padding='SAME'),
+      WideResnetGroup(n_blocks, 16 * widen_factor, bn_momentum=bn_momentum,
+                      mode=mode),
+      WideResnetGroup(n_blocks, 32 * widen_factor, (2, 2),
+                      bn_momentum=bn_momentum, mode=mode),
+      WideResnetGroup(n_blocks, 64 * widen_factor, (2, 2),
+                      bn_momentum=bn_momentum, mode=mode),
+      tl.BatchNorm(momentum=bn_momentum, mode=mode),
       tl.Relu(),
       tl.AvgPool(pool_size=(8, 8)),
       tl.Flatten(),
-      tl.Dense(num_output_classes),
-      tl.LogSoftmax()
+      tl.Dense(n_output_classes),
+      tl.LogSoftmax(),
   )

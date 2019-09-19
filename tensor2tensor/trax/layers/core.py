@@ -19,8 +19,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import operator as op
-from six.moves import reduce
+import jax
+import numpy as onp
+
 from tensor2tensor.trax import backend
 from tensor2tensor.trax.backend import numpy as np
 from tensor2tensor.trax.layers import base
@@ -29,12 +30,39 @@ from tensor2tensor.trax.layers import initializers as init
 
 @base.layer()
 def Relu(x, **unused_kwargs):
-  return np.maximum(x, np.array(0, dtype=x.dtype))
+  return np.maximum(x, np.zeros_like(x))
+
+
+@base.layer()
+def ParametricRelu(x, a=1., **unused_kwargs):
+  return np.maximum(a * x, np.zeros_like(x))
+
+
+@base.layer()
+def LeakyRelu(x, a=0.01, **unused_kwargs):
+  return np.where(x >= 0, x, a * x)
+
+
+@base.layer()
+def Elu(x, a=1., **unused_kwargs):
+  return np.where(x > 0, x, a * np.expm1(x))
+
+
+@base.layer()
+def Selu(x,
+         alpha=1.6732632423543772848170429916717,
+         lmbda=1.0507009873554804934193349852946):
+  return lmbda * np.where(x > 0, x, alpha * np.expm1(x))
+
+
+@base.layer()
+def Gelu(x, **unused_kwargs):
+  return x * backend.erf(x)
 
 
 @base.layer()
 def Sigmoid(x, **unused_kwargs):
-  return 1. / (1. + np.exp(-x))
+  return backend.expit(x)
 
 
 @base.layer()
@@ -78,87 +106,99 @@ def Softplus(x, **unused_kwargs):
   return np.logaddexp(x, 0.)
 
 
+@base.layer()
+def ToFloat(x, **unused_kwargs):
+  return x.astype(onp.float32)
+
+
 class Dense(base.Layer):
   """Layer constructor function for a dense (fully-connected) layer."""
 
-  def __init__(self, units,
+  def __init__(self,
+               n_units,
                kernel_initializer=init.GlorotUniformInitializer(),
                bias_initializer=init.RandomNormalInitializer(1e-6)):
     super(Dense, self).__init__()
-    self._units = units
+    self._n_units = n_units
     self._kernel_initializer = kernel_initializer
     self._bias_initializer = bias_initializer
 
-  def call(self, x, params, **kwargs):
+  def call(self, x, params, state, **kwargs):
     del kwargs
     w, b = params
-    return np.dot(x, w) + b
+    return np.dot(x, w) + b, state
 
-  def output_shape(self, input_shape):
-    return tuple(input_shape[:-1]) + (self._units,)
-
-  def new_parameters(self, input_shape, rng):
+  def new_parameters(self, input_shape, input_dtype, rng):
+    del input_dtype
     rng1, rng2 = backend.random.split(rng, 2)
-    w = self._kernel_initializer((input_shape[-1], self._units), rng1)
-    b = self._bias_initializer((self._units,), rng2)
-    return (w, b)
+    w = self._kernel_initializer((input_shape[-1], self._n_units), rng1)
+    b = self._bias_initializer((self._n_units,), rng2)
+    return (w, b), ()
 
 
 class Embedding(base.Layer):
   """Layer constructor function for an embedding layer."""
 
-  def __init__(self, feature_depth, vocab_size,
+  def __init__(self,
+               d_feature,
+               vocab_size,
                kernel_initializer=init.GlorotUniformInitializer()):
     super(Embedding, self).__init__()
-    self._feature_depth = feature_depth
+    self._d_feature = d_feature  # feature dimensionality
     self._vocab_size = vocab_size
     self._kernel_initializer = kernel_initializer
 
-  def call(self, x, params, **kwargs):
+  def call(self, x, params, state, **kwargs):
     del kwargs
-    return np.take(params, x, axis=0)
+    return np.take(params, x, axis=0), state
 
-  def output_shape(self, input_shape):
-    return tuple(input_shape) + (self._feature_depth,)
-
-  def new_parameters(self, input_shape, rng):
-    return self._kernel_initializer(
-        (self._vocab_size, self._feature_depth), rng)
+  def new_parameters(self, input_shape, input_dtype, rng):
+    del input_dtype
+    return self._kernel_initializer((self._vocab_size, self._d_feature),
+                                    rng), ()
 
 
 # Flatten.
-def _flatten_output_shape(input_shape, num_axis_to_keep=1):  # pylint: disable=invalid-name
-  """Output shape of a flatten layer."""
-  if num_axis_to_keep >= len(input_shape):
-    raise ValueError(
-        "num_axis_to_keep[%d] should be less than input's rank[%d]" %
-        (num_axis_to_keep, len(input_shape)))
-  return tuple(input_shape[:num_axis_to_keep]) + (
-      reduce(op.mul, input_shape[num_axis_to_keep:], 1),)
-
-
-@base.layer(output_shape=_flatten_output_shape)
-def Flatten(x, params, num_axis_to_keep=1, **kwargs):
-  del params, kwargs
-  return np.reshape(x, (x.shape[:num_axis_to_keep] + (-1,)))
-
-
 @base.layer()
-def Dropout(x, params, rate=0.0, mode='train', rng=None, **kwargs):
-  """Layer construction function for a dropout layer with given rate."""
+def Flatten(x, params, n_axes_to_keep=1, **kwargs):
   del params, kwargs
-  if rng is None:
-    msg = ('Dropout layer requires apply_fun to be called with a rng keyword '
-           'argument. That is, instead of `Dropout(params, inputs)`, call '
-           'it like `Dropout(params, inputs, rng=key)`.')
-    raise ValueError(msg)
-  if rate >= 1.0:
-    raise ValueError('Dropout rate (%f) must be lower than 1.' % rate)
-  if mode == 'train' and rate > 0.0:
+  if n_axes_to_keep >= len(x.shape):
+    raise ValueError("n_axes_to_keep[%d] should be less than input's rank[%d]" %
+                     (n_axes_to_keep, len(x.shape)))
+  return np.reshape(x, (x.shape[:n_axes_to_keep] + (-1,)))
+
+
+class Dropout(base.Layer):
+  """Dropout."""
+
+  def __init__(self, rate=0.0, name='dropout', mode='train'):
+    super(Dropout, self).__init__()
+    self._initial_rate = rate
+    # TODO(lukaszkaiser): remove the name property by the end of September'19.
+    # It's only needed for a specific purpose in the short term, will go.
+    self._name = 'dropout_' + name
+    self._mode = mode
+
+  def new_parameters(self, input_shape, input_dtype, rng):
+    """Initialize dropout parameters and state."""
+    del input_shape, input_dtype, rng
+    return (), {self._name: np.array(self._initial_rate)}
+
+  def call(self, x, params, state, rng=None, **unused_kwargs):
+    """Execute dropout."""
+    del params
+    rate = self._initial_rate
+    if isinstance(state, dict) and self._name in state:
+      rate = state[self._name]
+    if rng is None:
+      msg = ('Dropout layer requires apply_fn to be called with a rng keyword '
+             'argument. That is, instead of `Dropout(params, inputs)`, call '
+             'it like `Dropout(params, inputs, rng=key)`.')
+      raise ValueError(msg)
+    if self._mode != 'train':
+      return x, state
     keep = backend.random.bernoulli(rng, 1.0 - rate, x.shape)
-    return np.where(keep, x / (1.0 - rate), 0)
-  else:
-    return x
+    return np.where(keep, x / (1.0 - rate), np.zeros_like(x)), state
 
 
 @base.layer()
@@ -175,18 +215,15 @@ def AddConstant(x, params, constant=0.0, **unused_kwargs):
 
 def one_hot(x, size, dtype=np.float32):  # pylint: disable=invalid-name
   """Make a n+1 dim one-hot array from n dim int-categorical array."""
-  return np.array(x[..., np.newaxis] == np.arange(size), dtype)
+  arange_size = np.arange(size)
+  if backend.get_name() == 'jax':
+    # Work around a jax broadcasting issue.
+    arange_size = jax.lax.tie_in(x, arange_size)
+  return np.array(x[..., np.newaxis] == arange_size, dtype)
 
 
 # Mean.
-def _mean_output_shape(input_shape, axis=-1, keepdims=False):  # pylint: disable=invalid-name
-  shape1 = list(input_shape)[:axis]  # Shape before axis.
-  shape2 = list(input_shape)[axis:][1:]  # Shape after axis.
-  mid_shape = [1] if keepdims else []
-  return tuple(shape1 + mid_shape + shape2)
-
-
-@base.layer(output_shape=_mean_output_shape)
+@base.layer()
 def Mean(x, params, axis=-1, keepdims=False, **kwargs):
   del params, kwargs
   return np.mean(x, axis=axis, keepdims=keepdims)

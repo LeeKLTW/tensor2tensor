@@ -65,7 +65,7 @@ def add_scope(scope=None, scope_fn=None):
 
 
 def add_var_scope(scope=None):
-  return add_scope(scope, scope_fn=tf.variable_scope)
+  return add_scope(scope, scope_fn=tf.compat.v1.variable_scope)
 
 
 def add_name_scope(scope=None):
@@ -1044,7 +1044,7 @@ def local_moe(x,
           noisy_gating=True,
           noise_epsilon=1e-2)
       importance = tf.reduce_sum(gates, 0)
-      loss = loss_coef * (cv_squared(importance) + cv_squared(load))
+      loss = (cv_squared(importance) + cv_squared(load))
     else:
       assert hparams.gating_type == "vq"
       tf.logging.info("Using VQ gating")

@@ -1546,7 +1546,10 @@ class T2TModel(base.Layer):
     return create_host_call(self.hparams.model_dir)
 
   def create_eval_host_call(self):
-    return self.create_train_host_call()
+    eval_dir = os.path.join(
+        self.hparams.model_dir,
+        self.hparams.get("eval_dir_name", "eval"))
+    return create_host_call(eval_dir)
 
   def estimator_spec_train(self, loss, num_async_replicas=1, use_tpu=False):
     """Constructs `tf.estimator.EstimatorSpec` for TRAIN (training) mode."""
@@ -1698,6 +1701,13 @@ class T2TModel(base.Layer):
       outputs = infer_out
       scores = None
 
+    # Workaround for "ValueError: prediction values must be from the default
+    # graph" during TPU model exporting.
+    # TODO(b/130501786): remove tf.identity once default graph mismatch is fixed
+    if use_tpu:
+      for name, feature in features.items():
+        features[name] = tf.identity(feature)
+
     inputs = features.get("inputs")
     if inputs is None:
       inputs = features["targets"]
@@ -1812,10 +1822,15 @@ class T2TModel(base.Layer):
 
     # Only do scheduled sampling on language tasks.
     modality = problem_hparams.modality["targets"]
-    if modality != modalities.ModalityType.SYMBOL:
+    if modality not in [
+        modalities.ModalityType.SYMBOL,
+        modalities.ModalityType.SYMBOL_WEIGHTS_ALL,
+        modalities.ModalityType.IMAGE
+    ]:
       assert hparams.scheduled_sampling_prob == 0, (
-          "Scheduled sampling only applies to ModalityType.SYMBOL. Set "
-          "hparams.scheduled_sampling_prob == 0.0.")
+          "Scheduled sampling only applies to ModalityType.(SYMBOL, "
+          "SYMBOL_WEIGHTS_ALL, IMAGE). Found {modality}. Set "
+          "hparams.scheduled_sampling_prob == 0.0.").format(modality=modality)
       return (logits, losses)
 
     # Only do scheduled sampling when training.
@@ -1838,22 +1853,51 @@ class T2TModel(base.Layer):
       return tf.to_int32(reshaped_samples)
 
     # TODO(duckworthd): Move to scheduled_sampling.py.
-    def mix_gold_sampled(gold_targets, sampled_targets, mixin_prob):
+    def mix_gold_sampled(gold_targets,
+                         sampled_targets,
+                         mixin_prob,
+                         i,
+                         prev_new_targets):
       """Interleave sampled and gold tokens randomly."""
-      return tf.where(
-          tf.less(
-              tf.random_uniform(common_layers.shape_list(sampled_targets)),
-              mixin_prob),
+      # Resample each location iid.
+      should_use_sampled_targets = tf.less(
+          tf.random_uniform(common_layers.shape_list(sampled_targets)),
+          mixin_prob)
+      mixed_targets = tf.where(
+          should_use_sampled_targets,
           sampled_targets,
           gold_targets)
 
+      # Reuse sample tokens for earlier timesteps.
+      new_targets = tf.where(
+          is_later_timestep(gold_targets, i),
+          mixed_targets,
+          prev_new_targets)
+      return new_targets
+
     # TODO(duckworthd): Move to scheduled_sampling.py.
-    def parallel_scheduled_sampling_pass(features, logits, mixin_prob):
+    def is_later_timestep(x, pass_idx):
+      """Constructs mask based on timestep."""
+      assert x.shape.ndims == 4, x.shape
+      x_shape = tf.shape(x)
+      num_timesteps = x_shape[1]
+      timesteps = tf.range(num_timesteps)
+      timesteps = tf.reshape(timesteps, [1, num_timesteps, 1, 1])
+      # The following is a bit untrue. For images, "num_timesteps" actually
+      # represents image height, not time. We ignore that fact here.
+      timesteps = tf.broadcast_to(timesteps, x_shape)
+      return tf.greater_equal(timesteps, pass_idx)
+
+    # TODO(duckworthd): Move to scheduled_sampling.py.
+    def parallel_scheduled_sampling_pass(
+        i, prev_new_targets, features, logits, mixin_prob):
       """Generate scheduled sampling results."""
       sampled_targets = sample(logits)
       new_targets = mix_gold_sampled(features["targets"],
                                      sampled_targets,
-                                     mixin_prob)
+                                     mixin_prob,
+                                     i,
+                                     prev_new_targets)
       new_targets = tf.stop_gradient(new_targets)  # Treat new_targets as given.
       new_features = copy.copy(features)
       new_features["targets"] = new_targets
@@ -1879,7 +1923,7 @@ class T2TModel(base.Layer):
         else:
           new_losses["training"] = 0.0
 
-      return new_logits, new_losses
+      return new_targets, new_logits, new_losses
 
     tf.logging.info("Using scheduled sampling.")
     tf.logging.info("Warming scheduled sampling up with schedule: %s",
@@ -1912,9 +1956,10 @@ class T2TModel(base.Layer):
           "hparams.scheduled_sampling_prob > 0.0")
       new_logits = logits
       new_losses = losses
-      for _ in range(hparams.scheduled_sampling_num_passes):
-        new_logits, new_losses = parallel_scheduled_sampling_pass(
-            features, new_logits, mixin_prob)
+      prev_new_targets = features["targets"]
+      for i in range(hparams.scheduled_sampling_num_passes):
+        prev_new_targets, new_logits, new_losses = parallel_scheduled_sampling_pass(
+            i, prev_new_targets, features, new_logits, mixin_prob)
       return new_logits, new_losses
     else:
       raise ValueError(
@@ -1960,6 +2005,18 @@ TPU_METRIC_BLACKLIST = set([
 def create_tpu_eval_metrics_fn(problem, model_hparams):
   """Create the metrics_fn that TPUEstimatorSpec expects."""
 
+  def reduce_dimensions(predictions, labels):
+    """Reduce dimensions for high-dimensional predictions and labels."""
+    if len(predictions.get_shape()) > 5:
+      predictions_shape = common_layers.shape_list(predictions)
+      predictions = tf.reshape(
+          predictions, [predictions_shape[0], predictions_shape[1], -1,
+                        predictions_shape[-1]])
+      labels_shape = common_layers.shape_list(labels)
+      labels = tf.reshape(
+          labels, [labels_shape[0], labels_shape[1], -1])
+    return predictions, labels
+
   metric_fns = []
   eval_metrics = problem.eval_metric_fns(model_hparams)
 
@@ -1969,11 +2026,14 @@ def create_tpu_eval_metrics_fn(problem, model_hparams):
       weights_fn = modalities.get_weights_fn(v)
 
       def make_metric_fn(metric_fn):
+        """returns a metric_fn."""
         def wrapped_metric_fn(logits, labels, features, weights_fn=weights_fn):
           kwargs = {}
           args, _, keywords, _ = inspect.getargspec(metric_fn)
           if ("features" in args) or keywords:
             kwargs["features"] = features
+
+          logits, labels = reduce_dimensions(logits, labels)
           num, den = metric_fn(logits, labels, weights_fn=weights_fn, **kwargs)
           return tf.metrics.mean(num, den)
 
@@ -1989,11 +2049,14 @@ def create_tpu_eval_metrics_fn(problem, model_hparams):
     weights_fn = modalities.get_weights_fn(tm)
 
     def make_metric_fn(metric_fn):
+      """returns a metric fn."""
       def wrapped_metric_fn(logits, labels, features):
         kwargs = {}
         args, _, keywords, _ = inspect.getargspec(metric_fn)
         if ("features" in args) or keywords:
           kwargs["features"] = features
+
+        logits, labels = reduce_dimensions(logits, labels)
         num, den = metric_fn(logits, labels, weights_fn=weights_fn, **kwargs)
         return tf.metrics.mean(num, den)
 

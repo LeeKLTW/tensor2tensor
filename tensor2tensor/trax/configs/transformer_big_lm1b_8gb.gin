@@ -37,17 +37,21 @@ train.eval_frequency = 1000
 train.eval_steps = 10
 train.inputs = @trax.inputs.inputs
 train.model = @trax.models.TransformerLM
-train.optimizer = @trax.optimizers.sm3
-train.run_debug_step = False
+train.optimizer = @trax.optimizers.SM3
 train.train_steps = 500000
+
+# Parameters for DotProductCausalAttention:
+# ==============================================================================
+DotProductCausalAttention.dropout = 0.1
 
 # Parameters for TransformerLM:
 # ==============================================================================
+TransformerLM.attention_type = @trax.layers.DotProductCausalAttention
+TransformerLM.d_model = 1024
+TransformerLM.d_ff = 8192
 TransformerLM.dropout = 0.1
-TransformerLM.feature_depth = 1024
-TransformerLM.feedforward_depth = 8192
 TransformerLM.max_len = 2048
 TransformerLM.mode = 'train'
-TransformerLM.num_heads = 8
-TransformerLM.num_layers = 8
+TransformerLM.n_heads = 8
+TransformerLM.n_layers = 8
 TransformerLM.vocab_size = 32000

@@ -210,6 +210,7 @@ There are a number of translation data-sets in T2T:
 * English-Czech: `--problem=translate_encs_wmt32k`
 * English-Chinese: `--problem=translate_enzh_wmt32k`
 * English-Vietnamese: `--problem=translate_envi_iwslt32k`
+* English-Spanish: `--problem=translate_enes_wmt32k`
 
 You can get translations in the other direction by appending `_rev` to
 the problem name, e.g., for German-English use
@@ -225,6 +226,8 @@ which is close to state-of-the art. If training on a single GPU, try the
 `--hparams_set=transformer_base_single_gpu` setting. For very good results
 or larger data-sets (e.g., for English-French), try the big model
 with `--hparams_set=transformer_big`.
+
+See this [example](https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/notebooks/Transformer_translate.ipynb) to know how the translation works.
 
 ## Basics
 

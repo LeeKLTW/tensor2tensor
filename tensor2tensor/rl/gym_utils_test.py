@@ -67,26 +67,30 @@ class GymUtilsTest(tf.test.TestCase):
   # Just make an environment and expect to get one.
   def test_making_simple_env(self):
     env = gym_utils.make_gym_env("CartPole-v0")
-    self.assertTrue(isinstance(env, gym.Env))
+    self.assertIsInstance(env, gym.Env)
 
   # Make a time-wrapped environment and expect to get one.
   def test_making_timewrapped_env(self):
     env = gym_utils.make_gym_env("CartPole-v0", rl_env_max_episode_steps=1000)
-    self.assertTrue(isinstance(env, gym.Env))
-    self.assertTrue(isinstance(env, gym.wrappers.TimeLimit))
+    self.assertIsInstance(env, gym.Env)
+    self.assertIsInstance(env, gym.wrappers.TimeLimit)
     self.assertEqual(1000, env._max_episode_steps)
 
-  # Make a time-wrapped environment with unlimited limit.
+  # Make an instance of the environment without a TimeLimit
   def test_unlimited_env(self):
     env = gym_utils.make_gym_env("CartPole-v0", rl_env_max_episode_steps=None)
-    self.assertTrue(isinstance(env, gym.Env))
-    self.assertTrue(isinstance(env, gym.wrappers.TimeLimit))
-    self.assertTrue(env._max_episode_steps is None)
+    self.assertIsInstance(env, gym.Env)
+    self.assertNotIsInstance(env, gym.wrappers.TimeLimit)
 
   def test_rendered_env(self):
     env = gym_utils.RenderedEnv(SimpleEnv(), resize_to=(64, 12))
     obs, _, _, _ = env.step(1)
     self.assertTrue(np.allclose(np.zeros([64, 12, 3], np.uint8), obs))
+
+    env = gym_utils.RenderedEnv(SimpleEnv(), resize_to=(64, 12),
+                                output_dtype=np.float32)
+    obs, _, _, _ = env.step(1)
+    self.assertTrue(np.allclose(np.zeros([64, 12, 3], np.float32), obs))
 
   def test_gym_registration(self):
     reg_id, env = gym_utils.register_gym_env(
@@ -95,7 +99,7 @@ class GymUtilsTest(tf.test.TestCase):
     self.assertEqual("T2TEnv-SimpleEnv-v0", reg_id)
 
     # Most basic check.
-    self.assertTrue(isinstance(env, gym.Env))
+    self.assertIsInstance(env, gym.Env)
 
     # Just make sure we got the same environment.
     self.assertTrue(

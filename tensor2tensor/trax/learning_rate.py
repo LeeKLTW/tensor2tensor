@@ -16,33 +16,35 @@
 """trax learning rate schedules.
 
 The learning rate schedules here all have the signature:
-  lr: history -> (step -> lr)
+  lr: history -> (step -> {"learning_rate": lr})
 
 That is, they are functions that take a trax.history.History and return a
-function that takes a step and returns a learning rate.
+function that takes a step and returns a dict with entry "learning_rate".
 """
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import random
+import time
+
+from absl import logging
 import gin
+
+from tensor2tensor.trax import models as trax_models
+from tensor2tensor.trax import utils
 from tensor2tensor.trax.backend import numpy as np
-
-
-# A dictionary to memoize results of the MultifactorSchedule below.
-# We memoize because returning exactly the same function objects allows
-# later (in the training loop) to optimize re-compiling the function (for
-# running on an accelerator) only when it changes. Note that this does not
-# affect correctness, it is done purely for performance reasons.
-_memoized_multifactor_schedules = {}
+from tensor2tensor.trax.backend import random as jax_random
+from tensor2tensor.trax.rl import online_tune
+from tensor2tensor.trax.rl import ppo
 
 
 @gin.configurable(blacklist=["history"])
 def MultifactorSchedule(history=None,
                         factors="constant * linear_warmup * rsqrt_decay",
                         constant=0.1,
-                        warmup_steps=100,
+                        warmup_steps=400,
                         decay_factor=0.5,
                         steps_per_decay=20000):
   """Factor-based learning rate schedule.
@@ -62,13 +64,10 @@ def MultifactorSchedule(history=None,
     steps_per_decay: How often to decay the learning rate.
 
   Returns:
-    a function learning_rate(step): float -> float, the step-dependent lr.
+    a function learning_rate(step): float -> {"learning_rate": float}, the
+    step-dependent lr.
   """
   del history
-
-  cache_args = (factors, constant, warmup_steps)
-  if cache_args in _memoized_multifactor_schedules:
-    return _memoized_multifactor_schedules[cache_args]
 
   factors = [n.strip() for n in factors.split("*")]
 
@@ -86,9 +85,8 @@ def MultifactorSchedule(history=None,
         ret *= (decay_factor ** (step//steps_per_decay))
       else:
         raise ValueError("Unknown factor %s." % name)
-    return ret
+    return {"learning_rate": ret}
 
-  _memoized_multifactor_schedules[cache_args] = learning_rate
   return learning_rate
 
 
@@ -118,7 +116,8 @@ def EvalAdjustingSchedule(history,
     metric: which evaluation metric to use for adjustments.
 
   Returns:
-    a function learning_rate(step): float -> float, the step-dependent lr.
+    a function learning_rate(step): float -> {"learning_rate": float}, the
+    step-dependent lr.
   """
   metrics = history.get(history_mode, metric)
   adjusted = constant
@@ -141,3 +140,105 @@ def EvalAdjustingSchedule(history,
       steps_without_improvement = 0
 
   return MultifactorSchedule(history, constant=adjusted)
+
+
+@gin.configurable(blacklist=["history"])
+def PolicySchedule(
+    history,
+    observation_metrics=(
+        ("train", "metrics/accuracy"),
+        ("train", "metrics/loss"),
+        ("eval", "metrics/accuracy"),
+        ("eval", "metrics/loss"),
+    ),
+    include_lr_in_observation=False,
+    observation_range=(0.0, 5.0),
+    start_lr=0.001,
+    max_lr=10.0,
+    action_multipliers=(1.0 / 1.5, 1.0 / 1.25, 1.0, 1.25, 1.5),
+    policy_and_value_model=trax_models.FrameStackMLP,
+    policy_and_value_two_towers=False,
+    policy_and_value_vocab_size=None,
+    policy_dir=gin.REQUIRED,
+):
+  """Learning rate schedule controlled by a learned policy.
+
+  Args:
+    history: the history of training and evaluation (History object).
+    observation_metrics: list of pairs (mode, metric), as in the History object.
+    include_lr_in_observation: bool, whether to include the learning rate in
+      observations.
+    observation_range: tuple (low, high), range to clip the observation to.
+    start_lr: starting learning rate.
+    max_lr: maximum value to clip the learning rate to.
+    action_multipliers: sequence of LR multipliers that policy actions
+      correspond to.
+    policy_and_value_model: Trax model to use as the policy.
+    policy_and_value_two_towers: bool, whether the action distribution and value
+      prediction is computed by separate model towers.
+    policy_and_value_vocab_size: Vocabulary size of a policy and value network
+      operating on serialized representation. If None, use raw continuous
+      representation.
+    policy_dir: directory with the policy checkpoint.
+
+  Returns:
+    a function learning_rate(step): float -> {"learning_rate": float}, the
+    step-dependent lr.
+  """
+
+  # Turn the history into observations for the policy. If we don't have any,
+  # return the initial learning rate.
+  start_time = time.time()
+  lr_config = ("learning_rate", start_lr, (1e-9, max_lr), False)
+  if include_lr_in_observation:
+    control_configs = (lr_config,)
+  else:
+    control_configs = None
+  observations = online_tune.history_to_observations(
+      history, observation_metrics, observation_range, control_configs
+  )
+  logging.vlog(
+      1, "Building observations took %0.2f sec.", time.time() - start_time)
+  if observations.shape[0] == 0:
+    return lambda _: start_lr
+
+  # Build the policy network and load its parameters.
+  start_time = time.time()
+  net = ppo.policy_and_value_net(
+      n_controls=1,
+      n_actions=len(action_multipliers),
+      vocab_size=policy_and_value_vocab_size,
+      bottom_layers_fn=policy_and_value_model,
+      two_towers=policy_and_value_two_towers,
+  )
+  logging.vlog(
+      1, "Building the policy network took %0.2f sec.", time.time() - start_time
+  )
+  start_time = time.time()
+  # (opt_state, state, epoch, opt_step)
+  (opt_state, state, _, _) = ppo.maybe_restore_opt_state(policy_dir)
+  assert opt_state is not None, "Policy checkpoint not found."
+  (params, _) = opt_state
+  logging.vlog(
+      1, "Restoring the policy parameters took %0.2f sec.",
+      time.time() - start_time
+  )
+
+  # Run the policy and sample an action.
+  seed = random.randint(0, 2**31 - 1)
+  rng = jax_random.get_prng(seed=seed)
+  start_time = time.time()
+  # ((log_probs, value_preds), state). We have no way to pass state to the next
+  # step, but that should be fine.
+  ((log_probs, _), _) = net(np.array([observations]), params, state, rng=rng)
+  logging.vlog(
+      1, "Running the policy took %0.2f sec.", time.time() - start_time
+  )
+  # Sample from the action distribution for the last timestep.
+  action = utils.gumbel_sample(log_probs[0, -1, :])
+
+  # Get a new learning rate.
+  new_lr = online_tune.update_control(
+      lr_config, action.item(), history, action_multipliers
+  )
+  return lambda _: {"learning_rate": new_lr}

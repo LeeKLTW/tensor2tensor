@@ -211,6 +211,54 @@ def rlmb_dqn_base():
 
 
 @registry.register_hparams
+def rlmb_dqn_guess1():
+  """DQN guess1 params."""
+  hparams = rlmb_dqn_base()
+  hparams.set_hparam("base_algo_params", "dqn_guess1_params")
+  # At the moment no other option for evaluation, so we want long rollouts to
+  # not bias scores.
+  hparams.set_hparam("eval_rl_env_max_episode_steps", 5000)
+  return hparams
+
+
+@registry.register_hparams
+def rlmb_dqn_guess1_rainbow():
+  """Rainbow rlmb_dqn guess1 params."""
+  hparams = rlmb_dqn_guess1()
+  hparams.set_hparam("base_algo_params", "dqn_guess1_rainbow_params")
+  return hparams
+
+
+@registry.register_hparams
+def rlmb_dqn_rainbow_large_epsilon():
+  """Rainbow rlmb_dqn params."""
+  hparams = rlmb_dqn_guess1()
+  hparams.set_hparam("base_algo_params", "dqn_rainbow_params")
+  hparams.set_hparam("dqn_agent_epsilon_train", 0.1)
+  hparams.add_hparam("real_dqn_agent_epsilon_train", 0.02)
+  simulated_rollout_length = 10
+  hparams.set_hparam("simulated_rollout_length", simulated_rollout_length)
+  hparams.set_hparam("dqn_time_limit", simulated_rollout_length)
+  return hparams
+
+
+@registry.register_hparams
+def rlmb_dqn_guess1_2m_replay_buffer():
+  """DQN guess1 params, 2M replay buffer."""
+  hparams = rlmb_dqn_guess1()
+  hparams.set_hparam("base_algo_params", "dqn_2m_replay_buffer_params")
+  return hparams
+
+
+@registry.register_hparams
+def rlmb_dqn_guess1_10m_replay_buffer():
+  """DQN guess1 params, 10M replay buffer."""
+  hparams = rlmb_dqn_guess1()
+  hparams.set_hparam("base_algo_params", "dqn_10m_replay_buffer_params")
+  return hparams
+
+
+@registry.register_hparams
 def rlmb_basetest():
   """Base setting but quicker with only 2 epochs."""
   hparams = rlmb_base()
@@ -357,6 +405,22 @@ def rlmb_base_stochastic_discrete_75k_model_steps():
   """Base setting with stochastic discrete model with 75k WM steps."""
   hparams = rlmb_base_stochastic_discrete()
   hparams.model_train_steps = 15000 * 5
+  return hparams
+
+
+@registry.register_hparams
+def rlmb_base_stochastic_discrete_20k_model_steps():
+  """Base SD setting with 20k WM steps."""
+  hparams = rlmb_base_stochastic_discrete()
+  hparams.model_train_steps = 20000
+  return hparams
+
+
+@registry.register_hparams
+def rlmb_base_stochastic_discrete_30k_model_steps():
+  """Base SD setting with 20k WM steps."""
+  hparams = rlmb_base_stochastic_discrete()
+  hparams.model_train_steps = 30000
   return hparams
 
 
@@ -601,6 +665,7 @@ def rlmb_dqn_tiny():
   hparams = rlmb_dqn_base()
   hparams = hparams.override_from_dict(_rlmb_tiny_overrides())
   update_hparams(hparams, dict(
+      base_algo_params="dqn_guess1_params",
       simulated_rollout_length=2,
       dqn_time_limit=2,
       dqn_num_frames=128,

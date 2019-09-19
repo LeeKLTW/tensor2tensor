@@ -19,7 +19,15 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
+import time
+
+import gym
 import numpy as np
+
+from tensor2tensor.envs import gym_env_problem
+from tensor2tensor.envs import rendered_env_problem
+from tensor2tensor.rl import gym_utils
 
 
 def done_indices(dones):
@@ -46,102 +54,139 @@ def play_env_problem_randomly(env_problem, num_steps):
     env_problem.reset(indices=done_indices(dones))
 
 
+def get_completed_trajectories_from_env(env,
+                                        n_trajectories,
+                                        raw_trajectory=False):
+  """Returns completed `n_trajectories` from `env`."""
+
+  # Just the raw trajectories.
+  if raw_trajectory:
+    return env.trajectories.completed_trajectories[:n_trajectories]
+
+  # The numpy version of the above.
+  completed_trajectories = []
+  for trajectory in env.trajectories.completed_trajectories[:n_trajectories]:
+    completed_trajectories.append(trajectory.as_numpy)
+  return completed_trajectories
+
+
 def play_env_problem_with_policy(env,
                                  policy_fun,
                                  num_trajectories=1,
                                  max_timestep=None,
-                                 boundary=20):
+                                 reset=True,
+                                 state=None,
+                                 rng=None,
+                                 temperature=1.0,
+                                 boundary=32,
+                                 len_history_for_policy=32,
+                                 num_to_keep=1,
+                                 abort_fn=None,
+                                 raw_trajectory=False):
   """Plays the given env with the policy function to collect trajectories.
 
   Args:
     env: environment object, should be a subclass of env_problem.EnvProblem.
-    policy_fun: callable, taking in observations((B, T) + OBS) and returning
-        back log-probabilities (B, T, A).
+    policy_fun: callable, taking in observations((B, RT) + OBS) and returning
+      back log-probabilities (B, AT, A).
     num_trajectories: int, number of trajectories to collect.
     max_timestep: int or None, if not None or a negative number, we cut any
-        trajectory that exceeds this time and mark that as completed by
-        resetting that trajectory.
-    boundary: this is the bucket length, we pad the observations to integer
-        multiples of this + 1 and then feed the padded observations to the
-        policy_fun.
+      trajectory that exceeds this time put it in the completed bin, and *dont*
+      reset the env.
+    reset: bool, true if we want to reset the envs. The envs are also reset if
+      max_max_timestep is None or < 0.
+    state: the state for `policy_fn`.
+    rng: jax rng, splittable.
+    temperature: float, temperature used in Gumbel sampling.
+    boundary: int, pad the sequences to the multiples of this number.
+    len_history_for_policy: int or None, the maximum history to keep for
+      applying the policy on. If None, use the whole history.
+    num_to_keep: int, while truncating trajectory how many time-steps to keep.
+    abort_fn: callable, If not None, then at every step call and abort the
+      trajectory collection if it returns True, if so reset the env and return
+      None.
+    raw_trajectory: bool, if True a list of trajectory.Trajectory objects is
+      returned, otherwise a list of numpy representations of
+      `trajectory.Trajectory` is returned.
 
   Returns:
-    Completed trajectories that is a list of triples of (observation, action,
-    reward) ndarrays.
+    A tuple, (trajectories, number of completed trajectories). Where
+    trajectories is a list of triples of (observation, action, reward) ndarrays.
   """
 
-  def multinomial_sample(probs):
-    """Sample from this vector of probabilities.
+  def gumbel_sample(log_probs):
+    """Gumbel sampling."""
+    u = np.random.uniform(low=1e-6, high=1.0 - 1e-6, size=log_probs.shape)
+    g = -np.log(-np.log(u))
+    return np.argmax((log_probs / temperature) + g, axis=-1)
 
-    Args:
-      probs: numpy array of shape (A,) where A is the number of actions, these
-        must sum up to 1.0
+  # We need to reset all environments, if we're coming here the first time.
+  if reset or max_timestep is None or max_timestep <= 0:
+    env.reset()
+  else:
+    # Clear completed trajectories held internally.
+    env.trajectories.clear_completed_trajectories()
 
-    Returns:
-      an integer of which action to pick.
-    """
-    return int(np.argwhere(np.random.multinomial(1, probs) == 1))
+  num_done_trajectories = 0
 
-  # We need to reset all environments.
-  env.reset()
+  policy_application_total_time = 0
+  env_actions_total_time = 0
+  bare_env_run_time = 0
+  while env.trajectories.num_completed_trajectories < num_trajectories:
+    # Check if we should abort and return nothing.
+    if abort_fn and abort_fn():
+      # We should also reset the environment, since it will have some
+      # trajectories (complete and incomplete) that we want to discard.
+      env.reset()
+      return None, 0, {}, state
 
-  while True:
     # Get all the observations for all the active trajectories.
-    # Shape is (B, T) + OBS
-    padded_observations = env.trajectories.observations_np(boundary=boundary)
-    lengths = env.trajectories.trajectory_lengths
+    # Shape is (B, RT) + OBS
+    # Bucket on whatever length is needed.
+    padded_observations, lengths = env.trajectories.observations_np(
+        boundary=boundary,
+        len_history_for_policy=len_history_for_policy)
 
-    B, T = padded_observations.shape[:2]  # pylint: disable=invalid-name
+    B = padded_observations.shape[0]  # pylint: disable=invalid-name
 
     assert B == env.batch_size
     assert (B,) == lengths.shape
 
-    log_prob_actions = policy_fun(padded_observations)
-    assert (B, T) == log_prob_actions.shape[:2]
-    A = log_prob_actions.shape[2]  # pylint: disable=invalid-name
+    t1 = time.time()
+    log_probs, value_preds, state, rng = policy_fun(
+        padded_observations, lengths, state=state, rng=rng)
+    policy_application_total_time += (time.time() - t1)
 
-    # We need the log_probs of those actions that correspond to the last actual
-    # time-step.
-    index = lengths - 1  # Since we want to index using lengths.
-    log_probs = log_prob_actions[np.arange(B)[:, None],
-                                 index[:, None],
-                                 np.arange(A)]
-    assert (B, A) == log_probs.shape, \
-        "B=%d, A=%d, log_probs.shape=%s" % (B, A, log_probs.shape)
+    assert B == log_probs.shape[0]
 
-    # Convert to probs, since we need to do categorical sampling.
-    probs = np.exp(log_probs)
-
-    # Sometimes log_probs contains a 0, it shouldn't. This makes the
-    # probabilities sum up to more than 1, since the addition happens
-    # in float64, so just add and subtract 1.0 to zero those probabilites
-    # out.
-    #
-    # Also testing for this is brittle.
-    probs += 1
-    probs -= 1
-
-    # For some reason, sometimes, this isn't the case.
-    probs_sum = np.sum(probs, axis=1, keepdims=True)
-    if not all(probs_sum == 1.0):
-      probs = probs / probs_sum
-
-    # Now pick actions from this probs array.
-    actions = np.apply_along_axis(multinomial_sample, 1, probs)
+    actions = gumbel_sample(log_probs)
+    if isinstance(env.action_space, gym.spaces.Discrete):
+      actions = np.squeeze(actions, axis=1)
 
     # Step through the env.
-    _, _, dones, _ = env.step(actions)
+    t1 = time.time()
+    _, _, dones, env_infos = env.step(
+        actions,
+        infos={
+            "log_prob_actions": log_probs,
+            "value_predictions": value_preds,
+        })
+    env_actions_total_time += (time.time() - t1)
+    bare_env_run_time += sum(
+        info["__bare_env_run_time__"] for info in env_infos)
+
+    # Count the number of done trajectories, the others could just have been
+    # truncated.
+    num_done_trajectories += np.sum(dones)
 
     # Get the indices where we are done ...
     done_idxs = done_indices(dones)
 
     # ... and reset those.
+    t1 = time.time()
     if done_idxs.size:
       env.reset(indices=done_idxs)
-
-    # Do we have enough trajectories right now?
-    if env.trajectories.num_completed_trajectories >= num_trajectories:
-      break
+    env_actions_total_time += (time.time() - t1)
 
     if max_timestep is None or max_timestep < 1:
       continue
@@ -151,16 +196,70 @@ def play_env_problem_with_policy(env,
     exceeded_time_limit_idxs = done_indices(lengths > max_timestep)
 
     # If so, reset these as well.
+    t1 = time.time()
     if exceeded_time_limit_idxs.size:
-      env.reset(indices=exceeded_time_limit_idxs)
-    # Do we have enough trajectories right now?
-    if env.trajectories.num_completed_trajectories >= num_trajectories:
-      break
+      # This just cuts the trajectory, doesn't reset the env, so it continues
+      # from where it left off.
+      env.truncate(indices=exceeded_time_limit_idxs, num_to_keep=num_to_keep)
+    env_actions_total_time += (time.time() - t1)
 
   # We have the trajectories we need, return a list of triples:
   # (observations, actions, rewards)
-  completed_trajectories = []
-  for trajectory in env.trajectories.completed_trajectories[:num_trajectories]:
-    completed_trajectories.append(trajectory.as_numpy)
+  completed_trajectories = get_completed_trajectories_from_env(
+      env, num_trajectories, raw_trajectory=raw_trajectory)
 
-  return completed_trajectories
+  timing_info = {
+      "trajectory_collection/policy_application": policy_application_total_time,
+      "trajectory_collection/env_actions": env_actions_total_time,
+      "trajectory_collection/env_actions/bare_env": bare_env_run_time,
+  }
+  timing_info = {k: round(1000 * v, 2) for k, v in timing_info.items()}
+
+  return completed_trajectories, num_done_trajectories, timing_info, state
+
+
+def make_env(batch_size=1,
+             env_problem_name="",
+             resize=True,
+             resize_dims=(105, 80),
+             max_timestep="None",
+             clip_rewards=True,
+             parallelism=1,
+             use_tpu=False,
+             **env_kwargs):
+  """Creates the env."""
+
+  if clip_rewards:
+    env_kwargs.update({"reward_range": (-1, 1), "discrete_rewards": True})
+  else:
+    env_kwargs.update({"discrete_rewards": False})
+
+  # No resizing needed, so let's be on the normal EnvProblem.
+  if not resize:  # None or False
+    return gym_env_problem.GymEnvProblem(
+        base_env_name=env_problem_name,
+        batch_size=batch_size,
+        parallelism=parallelism,
+        **env_kwargs)
+
+  try:
+    max_timestep = int(max_timestep)
+  except Exception:  # pylint: disable=broad-except
+    max_timestep = None
+
+  wrapper_fn = functools.partial(
+      gym_utils.gym_env_wrapper, **{
+          "rl_env_max_episode_steps": max_timestep,
+          "maxskip_env": True,
+          "rendered_env": True,
+          "rendered_env_resize_to": resize_dims,
+          "sticky_actions": False,
+          "output_dtype": np.int32 if use_tpu else None,
+      })
+
+  return rendered_env_problem.RenderedEnvProblem(
+      base_env_name=env_problem_name,
+      batch_size=batch_size,
+      parallelism=parallelism,
+      env_wrapper_fn=wrapper_fn,
+      **env_kwargs)
